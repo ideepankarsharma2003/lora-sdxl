@@ -1,0 +1,10 @@
+torch
+torchvision
+transformers
+diffusers
+accelerate
+bitsandbytes
+peft
+datasets
+huggingface_hub
+tensorboard
