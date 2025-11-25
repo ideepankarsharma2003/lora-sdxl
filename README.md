@@ -39,12 +39,17 @@ To solve this, I implemented the following optimizations:
 6.  **Gradient Accumulation**:
     -   To achieve an effective batch size suitable for training without OOM, I use a physical batch size of 1 and accumulate gradients over 4 steps (effective batch size = 4).
 
+7.  **Pre-computation of Latents & Embeddings**:
+    -   **Crucial for T4**: Instead of encoding images and text on-the-fly during training (which keeps VAE and Text Encoders in VRAM), I pre-compute all latents and embeddings before the training loop starts.
+    -   This allows me to **unload** the VAE and Text Encoders from memory, freeing up significant VRAM (approx. 4GB+) for the UNet and optimizer states.
+    -   *Note*: This adds a small startup time to process the dataset but enables training on 16GB VRAM without OOM.
+
 ## Setup & Installation
 
 1.  **Clone the repository**:
     ```bash
-    git clone <repo_url>
-    cd <repo_name>
+    git clone https://github.com/ideepankarsharma2003/lora-sdxl.git
+    cd lora-sdxl
     ```
 
 2.  **Install dependencies**:
@@ -70,7 +75,7 @@ To solve this, I implemented the following optimizations:
 Run the training script. By default, it uses the settings optimized for T4 (Resolution 1024, Batch Size 1, Gradient Accumulation 4).
 
 ```bash
-accelerate launch train.py \
+accelerate launch --mixed_precision="fp16" train.py \
   --pretrained_model_name_or_path="stabilityai/stable-diffusion-xl-base-1.0" \
   --dataset_name="lambdalabs/naruto-blip-captions" \
   --output_dir="sdxl-naruto-lora" \

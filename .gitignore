@@ -12,3 +12,4 @@ wheels/
 
 # adapters
 sdxl-naruto-lora/
+inference_outputs/

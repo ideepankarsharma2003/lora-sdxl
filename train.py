@@ -1,6 +1,7 @@
 import argparse
 import os
 import torch
+import gc
 from datasets import load_dataset
 from diffusers import AutoencoderKL, UNet2DConditionModel, DDPMScheduler
 from diffusers.loaders import LoraLoaderMixin
@@ -30,7 +31,7 @@ def to_json_string(self):
 
 FrozenDict.to_json_string = to_json_string
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple SDXL LoRA training script.")
@@ -56,61 +57,133 @@ def parse_args():
     args = parser.parse_args()
     return args
 
+def import_model_class_from_model_name_or_path(pretrained_model_name_or_path: str, revision: str):
+    text_encoder_config = PretrainedConfig.from_pretrained(
+        pretrained_model_name_or_path,
+        subfolder="text_encoder",
+        revision=revision,
+    )
+    model_class = text_encoder_config.architectures[0]
+
+    if model_class == "CLIPTextModel":
+        from transformers import CLIPTextModel
+
+        return CLIPTextModel
+    elif model_class == "RobertaSeriesModelWithTransformation":
+        from diffusers.pipelines.alt_diffusion.modeling_roberta_series import RobertaSeriesModelWithTransformation
+
+        return RobertaSeriesModelWithTransformation
+    else:
+        raise ValueError(f"{model_class} is not supported.")
+
+def tokenize_captions(captions, tokenizer):
+    inputs = tokenizer(
+        captions, 
+        max_length=tokenizer.model_max_length, 
+        padding="max_length", 
+        truncation=True, 
+        return_tensors="pt"
+    )
+    return inputs.input_ids
+
+@torch.no_grad()
+def prepare_train_dataset(dataset, tokenizer_one, tokenizer_two, text_encoder_one, text_encoder_two, vae, args):
+    # Pre-compute latents and embeddings
+    # This function will return a new dataset with "model_input", "prompt_embeds", "pooled_prompt_embeds", "time_ids"
+    
+    processed_data = []
+    
+    train_resize = transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR)
+    train_crop = transforms.CenterCrop(args.resolution) 
+    train_transforms = transforms.Compose([
+        train_resize, 
+        train_crop, 
+        transforms.ToTensor(), 
+        transforms.Normalize([0.5], [0.5])
+    ])
+    
+    logger.info("Pre-computing latents and embeddings...")
+    
+    # Move models to GPU for processing
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    vae.to(device)
+    text_encoder_one.to(device)
+    text_encoder_two.to(device)
+    
+    for example in tqdm(dataset):
+        # 1. Image -> Latents
+        image = example["image"].convert("RGB")
+        pixel_values = train_transforms(image).unsqueeze(0).to(device, dtype=vae.dtype)
+        model_input = vae.encode(pixel_values).latent_dist.sample()
+        model_input = model_input * vae.config.scaling_factor
+        model_input = model_input.squeeze(0).cpu() # Move back to CPU to save VRAM
+        
+        # 2. Text -> Embeddings
+        caption = example["text"]
+        
+        # Tokenize
+        input_ids_one = tokenize_captions([caption], tokenizer_one).to(device)
+        input_ids_two = tokenize_captions([caption], tokenizer_two).to(device)
+        
+        # Encode
+        prompt_embeds_list = []
+        
+        # Text Encoder 1
+        output_one = text_encoder_one(input_ids_one, output_hidden_states=True)
+        prompt_embeds_list.append(output_one.hidden_states[-2])
+        
+        # Text Encoder 2
+        output_two = text_encoder_two(input_ids_two, output_hidden_states=True)
+        prompt_embeds_list.append(output_two.hidden_states[-2])
+        pooled_prompt_embeds = output_two.text_embeds
+        
+        prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
+        
+        # 3. Time IDs
+        # Assuming fixed resolution
+        original_size = (args.resolution, args.resolution)
+        target_size = (args.resolution, args.resolution)
+        crops_coords_top_left = (0, 0)
+        
+        add_time_ids = list(original_size + crops_coords_top_left + target_size)
+        add_time_ids = torch.tensor([add_time_ids])
+        
+        processed_data.append({
+            "model_input": model_input,
+            "prompt_embeds": prompt_embeds.squeeze(0).cpu(),
+            "pooled_prompt_embeds": pooled_prompt_embeds.squeeze(0).cpu(),
+            "time_ids": add_time_ids.squeeze(0).cpu()
+        })
+        
+    return processed_data
+
 @dataclass
 class SDXLDataCollator:
-    tokenizer_one: AutoTokenizer
-    tokenizer_two: AutoTokenizer
-    train_transforms: transforms.Compose
-    
     def __call__(self, examples):
-        pixel_values = []
-        input_ids_one = []
-        input_ids_two = []
+        model_input = torch.stack([x["model_input"] for x in examples])
+        prompt_embeds = torch.stack([x["prompt_embeds"] for x in examples])
+        pooled_prompt_embeds = torch.stack([x["pooled_prompt_embeds"] for x in examples])
+        time_ids = torch.stack([x["time_ids"] for x in examples])
         
-        for example in examples:
-            # Image processing
-            image = example["image"].convert("RGB")
-            pixel_values.append(self.train_transforms(image))
-            
-            # Text processing
-            input_ids_one.append(self.tokenize_captions(example["text"], self.tokenizer_one))
-            input_ids_two.append(self.tokenize_captions(example["text"], self.tokenizer_two))
-            
         return {
-            "pixel_values": torch.stack(pixel_values),
-            "input_ids_one": torch.stack(input_ids_one),
-            "input_ids_two": torch.stack(input_ids_two),
+            "model_input": model_input,
+            "prompt_embeds": prompt_embeds,
+            "pooled_prompt_embeds": pooled_prompt_embeds,
+            "time_ids": time_ids,
         }
 
-    def tokenize_captions(self, caption, tokenizer):
-        inputs = tokenizer(
-            caption, 
-            max_length=tokenizer.model_max_length, 
-            padding="max_length", 
-            truncation=True, 
-            return_tensors="pt"
-        )
-        return inputs.input_ids[0]
-
 class SDXLTrainer(Trainer):
-    def __init__(self, *args, text_encoder_one=None, text_encoder_two=None, vae=None, noise_scheduler=None, **kwargs):
+    def __init__(self, *args, noise_scheduler=None, **kwargs):
         super().__init__(*args, **kwargs)
-        self.text_encoder_one = text_encoder_one
-        self.text_encoder_two = text_encoder_two
-        self.vae = vae
         self.noise_scheduler = noise_scheduler
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Extract inputs
-        pixel_values = inputs["pixel_values"]
-        input_ids_one = inputs["input_ids_one"]
-        input_ids_two = inputs["input_ids_two"]
+        # Inputs are already latents and embeddings
+        latents = inputs["model_input"]
+        prompt_embeds = inputs["prompt_embeds"]
+        pooled_prompt_embeds = inputs["pooled_prompt_embeds"]
+        add_time_ids = inputs["time_ids"]
         
-        # VAE Encoding
-        with torch.no_grad():
-            latents = self.vae.encode(pixel_values.to(dtype=self.vae.dtype)).latent_dist.sample()
-            latents = latents * self.vae.config.scaling_factor
-
         # Sample noise
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
@@ -120,33 +193,7 @@ class SDXLTrainer(Trainer):
         # Add noise
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
-        # Text Encoding
-        with torch.no_grad():
-            prompt_embeds_list = []
-            pooled_prompt_embeds = None
-            
-            for tokenizer_input_ids, text_encoder in zip(
-                [input_ids_one, input_ids_two], 
-                [self.text_encoder_one, self.text_encoder_two]
-            ):
-                output = text_encoder(tokenizer_input_ids, output_hidden_states=True)
-                prompt_embeds_list.append(output.hidden_states[-2])
-                
-                if text_encoder == self.text_encoder_two:
-                    pooled_prompt_embeds = output.text_embeds
-            
-            prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
-
-        # Time IDs
-        # Assuming fixed resolution for simplicity as per original script
-        # In a real scenario, this should match the actual crop/size
-        resolution = pixel_values.shape[-1] # Assuming square
-        add_time_ids = torch.tensor(
-            [resolution, resolution, 0, 0, resolution, resolution], 
-            device=latents.device, 
-            dtype=prompt_embeds.dtype
-        ).repeat(bsz, 1)
-
+        # Prepare added_cond_kwargs
         added_cond_kwargs = {"text_embeds": pooled_prompt_embeds, "time_ids": add_time_ids}
 
         # Predict
@@ -178,24 +225,42 @@ def main():
         else:
             logger.warning("Push to hub enabled but no token provided.")
 
-    # Load Tokenizers
+    # 1. Load Tokenizers and Models for Preparation
+    logger.info("Loading models for data preparation...")
     tokenizer_one = AutoTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer", use_fast=False)
     tokenizer_two = AutoTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer_2", use_fast=False)
-
-    # Load Scheduler
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     
+    text_encoder_cls_one = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, revision=None)
+    text_encoder_cls_two = import_model_class_from_model_name_or_path(args.pretrained_model_name_or_path, revision=None) # Actually usually CLIPTextModelWithProjection
+
     # Load VAE
     vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
     
-    # Load UNet
+    # Load Text Encoders
+    text_encoder_one = text_encoder_cls_one.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder", torch_dtype=torch.float16, variant="fp16"
+    )
+    text_encoder_two = transformers.CLIPTextModelWithProjection.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder_2", torch_dtype=torch.float16, variant="fp16"
+    )
+    
+    # Dataset
+    dataset = load_dataset(args.dataset_name, split="train")
+    
+    # 2. Pre-compute Data
+    train_dataset = prepare_train_dataset(dataset, tokenizer_one, tokenizer_two, text_encoder_one, text_encoder_two, vae, args)
+    
+    # 3. Unload Models and Clear Cache
+    logger.info("Unloading preparation models...")
+    del tokenizer_one, tokenizer_two, text_encoder_one, text_encoder_two, vae
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    # 4. Load UNet for Training
+    logger.info("Loading UNet for training...")
     unet = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", torch_dtype=torch.float16, variant="fp16"
     )
-
-    # Freeze VAE and UNet parameters
-    vae.requires_grad_(False)
-    unet.requires_grad_(False)
     
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
@@ -216,35 +281,10 @@ def main():
         if param.requires_grad:
             param.data = param.data.to(torch.float32)
 
-    # Text Encoders
-    text_encoder_one = transformers.CLIPTextModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder", torch_dtype=torch.float16, variant="fp16"
-    )
-    text_encoder_two = transformers.CLIPTextModelWithProjection.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder_2", torch_dtype=torch.float16, variant="fp16"
-    )
-    
-    text_encoder_one.requires_grad_(False)
-    text_encoder_two.requires_grad_(False)
+    # Load Scheduler
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
 
-    # Dataset
-    dataset = load_dataset(args.dataset_name, split="train")
-    
-    # Transforms
-    train_resize = transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR)
-    train_crop = transforms.CenterCrop(args.resolution) 
-    train_transforms = transforms.Compose([
-        train_resize, 
-        train_crop, 
-        transforms.ToTensor(), 
-        transforms.Normalize([0.5], [0.5])
-    ])
-
-    data_collator = SDXLDataCollator(
-        tokenizer_one=tokenizer_one,
-        tokenizer_two=tokenizer_two,
-        train_transforms=train_transforms
-    )
+    data_collator = SDXLDataCollator()
 
     # Training Arguments
     training_args = TrainingArguments(
@@ -262,9 +302,9 @@ def main():
         push_to_hub=args.push_to_hub,
         hub_token=args.hub_token,
         hub_model_id=args.hub_model_id,
-        gradient_checkpointing=args.gradient_checkpointing,
+        gradient_checkpointing=False,
         optim="adamw_bnb_8bit" if args.use_8bit_adam else "adamw_torch",
-        remove_unused_columns=False, # Important for custom collator
+        remove_unused_columns=False,
         report_to="tensorboard",
         logging_dir=os.path.join(args.output_dir, "logs"),
     )
@@ -273,26 +313,10 @@ def main():
     trainer = SDXLTrainer(
         model=unet,
         args=training_args,
-        train_dataset=dataset,
+        train_dataset=train_dataset,
         data_collator=data_collator,
-        text_encoder_one=text_encoder_one,
-        text_encoder_two=text_encoder_two,
-        vae=vae,
         noise_scheduler=noise_scheduler,
     )
-
-    # Move models to device (Trainer handles model, but we need to handle others or let accelerate handle them if we passed them differently, 
-    # but here we pass them as attributes to trainer which puts them on device if they are modules? 
-    # Actually Trainer only handles 'model'. We need to ensure others are on the right device.)
-    # However, Trainer uses Accelerator internally.
-    # We can move them in __init__ or compute_loss using model.device.
-    
-    # A safer bet for T4 (limited VRAM) is to move them to device manually or let accelerate handle it if we were using it directly.
-    # Since we are inside Trainer, we can access trainer.accelerator.
-    
-    trainer.text_encoder_one.to(trainer.accelerator.device)
-    trainer.text_encoder_two.to(trainer.accelerator.device)
-    trainer.vae.to(trainer.accelerator.device)
 
     logger.info("Starting training...")
     trainer.train()
