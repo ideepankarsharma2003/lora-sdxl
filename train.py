@@ -325,6 +325,17 @@ def main():
     
     # Save adapter
     trainer.save_model(args.output_dir)
+    from peft import get_peft_model_state_dict
+    from diffusers.loaders import StableDiffusionXLLoraLoaderMixin  
+
+    # Extract only LoRA weights
+    lora_state_dict = get_peft_model_state_dict(unet)
+
+    # Save in diffusers format
+    StableDiffusionXLLoraLoaderMixin.save_lora_weights(
+        save_directory=args.output_dir,
+        unet_lora_layers=lora_state_dict,
+    )
     
     if args.push_to_hub:
         trainer.push_to_hub()
